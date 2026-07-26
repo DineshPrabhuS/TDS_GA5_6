@@ -2,9 +2,8 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from pathlib import Path
 from urllib.parse import urlparse
+from typing import Any, Dict
 import requests
-import ipaddress
-import socket
 
 app = FastAPI()
 
@@ -20,129 +19,130 @@ ALLOWED_HOSTS = {
 
 class RequestBody(BaseModel):
     tool: str
-    arguments: dict
+    arguments: Dict[str, Any] = {}
 
 
-def inside_sandbox(path_str):
+def inside_sandbox(path_str: str) -> bool:
     try:
         target = Path(path_str).resolve()
-        return (
-            target == SANDBOX
-            or SANDBOX in target.parents
-        )
+        return target == SANDBOX or SANDBOX in target.parents
     except Exception:
         return False
 
 
-def host_allowed(url):
-
+def host_allowed(url: str) -> bool:
     try:
         parsed = urlparse(url)
 
-        host = (parsed.hostname or "").lower()
-
-        if host not in ALLOWED_HOSTS:
+        # Block userinfo tricks
+        if parsed.username or parsed.password:
             return False
 
-        addresses = socket.getaddrinfo(
-            host,
-            None
-        )
+        host = (parsed.hostname or "").lower()
 
-        for addr in addresses:
-
-            ip = ipaddress.ip_address(
-                addr[4][0]
-            )
-
-            if (
-                ip.is_private
-                or ip.is_loopback
-                or ip.is_link_local
-                or ip.is_multicast
-            ):
-                return False
-
-        return True
+        # Exact host match only
+        return host in ALLOWED_HOSTS
 
     except Exception:
         return False
+
+
+@app.get("/")
+def home():
+    return {"status": "running"}
 
 
 @app.post("/")
 def guardrail(req: RequestBody):
+    try:
+        # -------------------------
+        # READ FILE
+        # -------------------------
+        if req.tool == "read_file":
 
-    if req.tool == "read_file":
+            path = str(req.arguments.get("path", ""))
 
-        path = req.arguments.get("path", "")
-
-        if not inside_sandbox(path):
-            return {
-                "action": "block",
-                "reason": "outside sandbox",
-                "result": None
-            }
-
-        try:
-            content = Path(path).read_text()
-
-            return {
-                "action": "allow",
-                "reason": "allowed",
-                "result": content
-            }
-
-        except Exception as e:
-
-            return {
-                "action": "allow",
-                "reason": "read attempted",
-                "result": str(e)
-            }
-
-    if req.tool == "fetch_url":
-
-        url = req.arguments.get("url", "")
-
-        if not host_allowed(url):
-            return {
-                "action": "block",
-                "reason": "host blocked",
-                "result": None
-            }
-
-        try:
-            response = requests.get(
-                url,
-                timeout=5,
-                allow_redirects=False
-            )
-
-            if (
-                300 <= response.status_code < 400
-            ):
+            if not inside_sandbox(path):
                 return {
                     "action": "block",
-                    "reason": "redirect blocked",
+                    "reason": "outside sandbox",
                     "result": None
                 }
 
-            return {
-                "action": "allow",
-                "reason": "allowed",
-                "result": response.text
-            }
+            try:
+                content = Path(path).read_text(
+                    encoding="utf-8",
+                    errors="ignore"
+                )
 
-        except Exception as e:
+                return {
+                    "action": "allow",
+                    "reason": "allowed",
+                    "result": {
+                        "content": content
+                    }
+                }
 
-            return {
-                "action": "block",
-                "reason": str(e),
-                "result": None
-            }
+            except Exception as e:
+                return {
+                    "action": "block",
+                    "reason": f"read error: {e}",
+                    "result": None
+                }
 
-    return {
-        "action": "block",
-        "reason": "unknown tool",
-        "result": None
-    }
+        # -------------------------
+        # FETCH URL
+        # -------------------------
+        if req.tool == "fetch_url":
+
+            url = str(req.arguments.get("url", ""))
+
+            if not host_allowed(url):
+                return {
+                    "action": "block",
+                    "reason": "host blocked",
+                    "result": None
+                }
+
+            try:
+                response = requests.get(
+                    url,
+                    timeout=5,
+                    allow_redirects=False
+                )
+
+                # Block redirects entirely
+                if 300 <= response.status_code < 400:
+                    return {
+                        "action": "block",
+                        "reason": "redirect blocked",
+                        "result": None
+                    }
+
+                return {
+                    "action": "allow",
+                    "reason": "allowed",
+                    "result": {
+                        "body": response.text
+                    }
+                }
+
+            except Exception as e:
+                return {
+                    "action": "block",
+                    "reason": f"fetch error: {e}",
+                    "result": None
+                }
+
+        return {
+            "action": "block",
+            "reason": "unknown tool",
+            "result": None
+        }
+
+    except Exception as e:
+        return {
+            "action": "block",
+            "reason": f"internal error: {e}",
+            "result": None
+        }
