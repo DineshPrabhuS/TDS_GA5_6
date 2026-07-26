@@ -1,63 +1,104 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
+from typing import Any, Dict, List
+import json
 import re
 
 app = FastAPI()
 
-class SkillRequest(BaseModel):
-    skill: str
+
+class Step(BaseModel):
+    step_number: int
+    tool: str
+    args: Dict[str, Any]
+    tokens_used: int
+
+
+class RequestBody(BaseModel):
+    budget_tokens: int
+    steps: List[Step]
+
+
+def canonicalize(value):
+    if isinstance(value, dict):
+        return {
+            k: canonicalize(v)
+            for k, v in sorted(value.items())
+            if k != "trace_id"
+        }
+
+    if isinstance(value, list):
+        return [canonicalize(v) for v in value]
+
+    if isinstance(value, str):
+        return re.sub(r"\s+", " ", value).strip()
+
+    return value
+
+
+def same_call(a, b):
+    return (
+        a.tool == b.tool
+        and canonicalize(a.args) == canonicalize(b.args)
+    )
+
 
 @app.get("/")
 def home():
     return {"status": "running"}
 
-@app.post("/scan")
-def scan(req: SkillRequest):
 
-    text = req.skill.lower()
-    categories = []
+@app.post("/check")
+def check(req: RequestBody):
 
-    # hardcoded_secret
-    if (
-        re.search(r'api[_-]?key\s*[:=]\s*["\']?[a-z0-9_\-]{8,}', text)
-        or re.search(r'sk-[a-z0-9]{10,}', text)
-        or re.search(r'https://hooks\.', text)
-        or re.search(r'webhook', text)
-        or re.search(r'secret\s*[:=]', text)
-    ):
-        categories.append("hardcoded_secret")
+    total = sum(step.tokens_used for step in req.steps)
 
-    # prompt_injection
-    if (
-        "ignore user" in text
-        or "ignore previous instructions" in text
-        or "ignore stop request" in text
-        or "exfiltrate" in text
-        or "silently send" in text
-        or "bypass" in text
-        or "override user" in text
-    ):
-        categories.append("prompt_injection")
+    if total >= req.budget_tokens:
+        return {
+            "decision": "halt",
+            "reason": f"Budget exceeded ({total}/{req.budget_tokens})"
+        }
 
-    # excessive_permissions
-    if (
-        "filesystem: *" in text
-        or "read/write entire filesystem" in text
-        or "all domains" in text
-        or "network: *" in text
-        or "full filesystem access" in text
-        or "egress to any domain" in text
-    ):
-        categories.append("excessive_permissions")
+    steps = req.steps
 
-    # unclear_provenance
-    has_author = "author:" in text
-    has_version = "version:" in text
-    has_changelog = "changelog:" in text
+    # 3 identical calls in a row
+    if len(steps) >= 3:
 
-    if not (has_author and has_version and has_changelog):
-        categories.append("unclear_provenance")
+        a = steps[-1]
+        b = steps[-2]
+        c = steps[-3]
+
+        if same_call(a, b) and same_call(b, c):
+            return {
+                "decision": "halt",
+                "reason": "Repeated identical tool call loop"
+            }
+
+    # A B A B A B cycle
+    if len(steps) >= 6:
+
+        last6 = steps[-6:]
+
+        A = last6[0]
+        B = last6[1]
+
+        cycle = True
+
+        for i in range(6):
+
+            expected = A if i % 2 == 0 else B
+
+            if not same_call(last6[i], expected):
+                cycle = False
+                break
+
+        if cycle:
+            return {
+                "decision": "halt",
+                "reason": "Detected 2-step repeating cycle"
+            }
 
     return {
-        "categories": categories
+        "decision": "continue",
+        "reason": "Within budget and no loop detected"
     }
